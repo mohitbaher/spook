@@ -1,0 +1,6 @@
+.spook/
+__pycache__/
+*.pyc
+*.db
+.env
+.claude/settings.local.json

@@ -13,6 +13,8 @@ DENY_AT = 5  # ponytail: fixed threshold, tune against an eval set if time allow
 TIMEOUT = 4
 ARCHIVE_MAX = 10 * 2**20  # ponytail: skip inspecting archives over 10 MB
 STATE = os.path.join(".spook", "state.json")
+BOOK = "spook-book.json"  # project root, so a team can share and review it through git
+BOOK_DAYS = 30  # ponytail: name-level blocks expire so fixed packages get re-checked; key by version/hash if needed
 MODEL = os.environ.get("SPOOK_MODEL", "gemma3:4b")  # swap for any local Ollama model, e.g. gemma3:1b
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 POPULAR_NPM = set("react react-dom express lodash axios chalk commander debug moment typescript webpack vite next vue eslint prettier jest mocha uuid dotenv cors body-parser mongoose request async underscore jquery bootstrap tslib rxjs zod yargs glob rimraf semver fs-extra inquirer ora nodemon passport socket.io redis".split())
@@ -347,19 +349,59 @@ def novelty(cmd, state):
     return results
 
 
-def check_command(cmd, fetch=get, state=None):
-    """Return [(item, score, reasons)] for everything risky or unverifiable in a shell command."""
+# --- item 12: Book of the Dead, remembered verdicts ---
+
+def now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def load_book(path=BOOK):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_book(book, path=BOOK):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(book, f, indent=1, sort_keys=True)
+
+
+def from_book(item, book):
+    """(score, reasons) for a remembered verdict, or None to check the item normally."""
+    e = book.get(item)
+    if not e:
+        return None
+    if e["verdict"] == "allow":
+        return 0, [f"allowed by the user on {e['t'][:10]}"]
+    if age_days(e["t"]) < BOOK_DAYS:
+        return 10, [f"in the Book of the Dead since {e['t'][:10]}: {'; '.join(e['reasons'])}"]
+    return None
+
+
+def check_command(cmd, fetch=get, state=None, book=None):
+    """Return [(item, score, reasons)] for everything risky or unverifiable in a shell command.
+
+    Records package verdicts in `book` (mutated) when the package itself is the problem."""
     state = state or new_state()
+    book = {} if book is None else book
     results = []
     if REMOTE_EXEC.search(cmd):
         results.append(("remote script piped to a shell", 10, ["downloads and runs code in one step"]))
     for eco, name in installs(cmd):
+        item = f"{eco}:{name}"
+        if known := from_book(item, book):  # instant, no network
+            results.append((item, *known))
+            continue
         try:
             score, why = (check_npm if eco == "npm" else check_pip)(name, fetch)
         except Exception as e:  # ponytail: fails open when offline; add a strict mode if wanted
             score, why = 0, [f"unchecked ({type(e).__name__})"]
-        extra, pwhy = provenance(f"{eco}:{name}", state)
-        results.append((f"{eco}:{name}", score + extra, why + pwhy))
+        if score >= DENY_AT:  # remember only verdicts about the package itself, never provenance (that depends on context)
+            book[item] = {"verdict": "block", "reasons": why, "by": "rules", "t": now_iso()}
+        extra, pwhy = provenance(item, state)
+        results.append((item, score + extra, why + pwhy))
     for u in URL.findall(cmd):
         extra, why = provenance("url:" + u.rstrip(".,;:").lower(), state)
         if extra:
@@ -429,10 +471,53 @@ def spawn_explainer(cmd, bad):
         return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
 
 
+# --- only the user may change Spook's memory: an agent that could would allow-list its own malware ---
+PROTECTED = re.compile(r"spook-book\.json|(^|[\s\\/'\"])\.spook\b|\.claude[\\/]settings(\.local)?\.json", re.I)
+READ_ONLY = {"cat", "type", "get-content", "gc", "head", "tail", "less", "more", "grep", "rg", "findstr", "ls", "dir", "wc", "jq"}
+
+
+def guard_spook(tool, inp):
+    """Reason to refuse if the agent tries to change Spook's book, state or settings; reading them is fine."""
+    if tool == "Bash":
+        cmd = inp.get("command", "")
+        if re.search(r"\bhook\.py\b.*\b(allow|forget)\b", cmd):
+            return "only the user may run Spook's allow/forget commands, in their own terminal"
+        first = os.path.basename((cmd.split() or [""])[0]).lower()
+        if PROTECTED.search(cmd) and (first not in READ_ONLY or ">" in cmd):  # ponytail: first-word heuristic
+            return "only the user may change Spook's files (spook-book.json, .spook/, .claude/settings)"
+        return None
+    path = (inp.get("file_path") or inp.get("notebook_path") or "").replace("\\", "/")
+    if PROTECTED.search(path):
+        return f"only the user may change Spook's files ({os.path.basename(path)})"
+
+
+def deny(reason):
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                                             "permissionDecisionReason": reason}}))
+
+
+def book_cli(action, items):
+    """python hook.py book | allow <item>... | forget <item>...   (run by the user, from the project folder)"""
+    book = load_book()
+    if action == "book":
+        for k, e in sorted(book.items()):
+            print(f"{e['verdict']:<5}  {k:<40} {e['t'][:10]}  {'; '.join(e.get('reasons', []))}")
+        return print(f"{len(book)} entries in {os.path.abspath(BOOK)}")
+    for item in items:
+        if action == "allow":
+            book[item] = {"verdict": "allow", "reasons": ["approved by the user"], "by": "user", "t": now_iso()}
+        else:
+            book.pop(item, None)
+        print(f"{action}: {item}")
+    save_book(book)
+
+
 def main():
     if sys.argv[1:2] == ["explain"]:
         job = json.loads(sys.argv[2])
         return explain_job(job["cmd"], job["bad"])
+    if sys.argv[1:2] in (["book"], ["allow"], ["forget"]):
+        return book_cli(sys.argv[1], sys.argv[2:])
     data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
     event = data.get("hook_event_name", "PreToolUse")
     state = load_state()
@@ -445,10 +530,16 @@ def main():
         if warning:
             print(json.dumps({"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": warning}}))
         return
+    if reason := guard_spook(data.get("tool_name"), data.get("tool_input", {})):
+        return deny(f"Spook refused: {reason}.")
     if data.get("tool_name") != "Bash":
         return
     cmd = data.get("tool_input", {}).get("command", "")
-    results = check_command(cmd, state=state)
+    book = load_book()
+    remembered = dict(book)
+    results = check_command(cmd, state=state, book=book)
+    if book != remembered:
+        save_book(book)
     bad = [r for r in results if r[1] >= DENY_AT]
     if not bad and hosts(cmd) - state["seen_hosts"]:  # learn hosts only from allowed commands
         state["seen_hosts"] |= hosts(cmd)
@@ -460,10 +551,10 @@ def main():
                                 "items": [{"item": i, "score": s, "why": w} for i, s, w in results]}) + "\n")
     if bad:
         spawn_explainer(cmd, bad)
-        print(json.dumps({"hookSpecificOutput": {
-            "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": f"Spook blocked {describe(bad)}. Nothing was run. "
-                                        "Re-run the command without the blocked item(s), or ask the user to approve it."}}))
+        pkgs = " ".join(i for i, _, _ in bad if i.startswith(("npm:", "pip:")))
+        override = f' If the user trusts it, they can run this in their own terminal: python "{os.path.abspath(__file__)}" allow {pkgs}' if pkgs else ""
+        deny(f"Spook blocked {describe(bad)}. Nothing was run. "
+             f"Re-run the command without the blocked item(s), or ask the user to approve it.{override}")
 
 
 if __name__ == "__main__":

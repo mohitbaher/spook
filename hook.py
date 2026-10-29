@@ -5,7 +5,7 @@ PostToolUse: remember packages/URLs the agent read in untrusted content (provena
 UserPromptSubmit: remember what the user actually asked for.
 Rules decide, Gemma (later) only explains. Fails open when a registry is unreachable.
 """
-import io, json, os, re, shlex, sys, tarfile, time, urllib.error, urllib.request, zipfile
+import io, json, os, re, shlex, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -13,6 +13,8 @@ DENY_AT = 5  # ponytail: fixed threshold, tune against an eval set if time allow
 TIMEOUT = 4
 ARCHIVE_MAX = 10 * 2**20  # ponytail: skip inspecting archives over 10 MB
 STATE = os.path.join(".spook", "state.json")
+MODEL = os.environ.get("SPOOK_MODEL", "gemma3:4b")  # swap for any local Ollama model, e.g. gemma3:1b
+OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 POPULAR_NPM = set("react react-dom express lodash axios chalk commander debug moment typescript webpack vite next vue eslint prettier jest mocha uuid dotenv cors body-parser mongoose request async underscore jquery bootstrap tslib rxjs zod yargs glob rimraf semver fs-extra inquirer ora nodemon passport socket.io redis".split())
 POPULAR_PIP = set("requests numpy pandas flask django boto3 urllib3 setuptools pip wheel pytest scipy matplotlib pillow pyyaml cryptography click jinja2 sqlalchemy fastapi uvicorn pydantic aiohttp beautifulsoup4 scikit-learn tensorflow torch openai anthropic".split())
 NPM_TOOLS = {"npm", "pnpm", "yarn", "bun"}
@@ -365,7 +367,72 @@ def check_command(cmd, fetch=get, state=None):
     return results + novelty(cmd, state)
 
 
+# --- Gemma explains, off the agent's path: the block is already decided by the rules ---
+PROMPT = """You are Spook, a quiet ghost that watches a developer's AI coding agent.
+The agent tried to run a shell command and Spook's rules blocked part of it.
+Tell the developer, in at most 3 short sentences of plain English: what was blocked, why it is risky, and what to do next.
+Use only the facts below and do not invent details about any package or site.
+Write every package name exactly as given, even if it looks misspelled: the misspelling may be the attack.
+One brief eerie touch is fine; accuracy comes first.
+
+Command: {cmd}
+Blocked: {items}"""
+
+
+def describe(bad):
+    return "; ".join(f"{i} ({', '.join(w)})" for i, _, w in bad)
+
+
+def explain(cmd, bad, timeout=150):
+    body = json.dumps({"model": MODEL, "prompt": PROMPT.format(cmd=cmd[:300], items=describe(bad)), "stream": False,
+                       "keep_alive": "15m", "options": {"temperature": 0.2, "num_predict": 120}}).encode()
+    req = urllib.request.Request(OLLAMA + "/api/generate", data=body, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        text = json.load(r)["response"].strip()
+    # the model must not "fix" a squatted name: make sure every blocked package appears verbatim
+    names = [i.split(":", 1)[1] for i, _, _ in bad if i.startswith(("npm:", "pip:"))]
+    missing = [n for n in names if n.lower() not in text.lower()]
+    return text + (f" (Exact blocked package: {', '.join(missing)}.)" if missing else "")
+
+
+def notify(text):
+    """Windows balloon notification; ponytail: other OSes only get the log file for now."""
+    if os.name != "nt":
+        return
+    script = ("Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; "
+              "$n.Icon = [System.Drawing.SystemIcons]::Warning; $n.Visible = $true; "
+              "$n.ShowBalloonTip(15000, 'Spook blocked something', $env:SPOOK_MSG, 'Warning'); Start-Sleep 15; $n.Dispose()")
+    subprocess.run(["powershell", "-NoProfile", "-Command", script], env={**os.environ, "SPOOK_MSG": text[:250]},
+                   creationflags=0x08000000, timeout=30)  # CREATE_NO_WINDOW
+
+
+def explain_job(cmd, bad):
+    """Background worker: ask local Gemma, log the answer, notify the user. Falls back to the rule reasons."""
+    try:
+        text, by = explain(cmd, bad), MODEL
+    except Exception as e:
+        text, by = f"Spook blocked {describe(bad)}.", f"rules only ({type(e).__name__})"
+    os.makedirs(".spook", exist_ok=True)
+    with open(".spook/explanations.jsonl", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": cmd, "explanation": text, "by": by}) + "\n")
+    notify(text)
+
+
+def spawn_explainer(cmd, bad):
+    args = [sys.executable, os.path.abspath(__file__), "explain", json.dumps({"cmd": cmd, "bad": bad})]
+    if os.name != "nt":
+        return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+    flags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
+    try:  # break away from the hook's job object so the worker outlives the hook
+        return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags | 0x01000000)
+    except OSError:
+        return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=flags)
+
+
 def main():
+    if sys.argv[1:2] == ["explain"]:
+        job = json.loads(sys.argv[2])
+        return explain_job(job["cmd"], job["bad"])
     data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
     event = data.get("hook_event_name", "PreToolUse")
     state = load_state()
@@ -392,10 +459,10 @@ def main():
             f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": cmd, "blocked": bool(bad),
                                 "items": [{"item": i, "score": s, "why": w} for i, s, w in results]}) + "\n")
     if bad:
-        detail = "; ".join(f"{i} ({', '.join(w)})" for i, _, w in bad)
+        spawn_explainer(cmd, bad)
         print(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse", "permissionDecision": "deny",
-            "permissionDecisionReason": f"Spook blocked {detail}. Nothing was run. "
+            "permissionDecisionReason": f"Spook blocked {describe(bad)}. Nothing was run. "
                                         "Re-run the command without the blocked item(s), or ask the user to approve it."}}))
 
 

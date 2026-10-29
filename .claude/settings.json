@@ -1,14 +1,25 @@
 {
   "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          { "type": "command", "command": "python \"${CLAUDE_PROJECT_DIR}/hook.py\"", "timeout": 10 }
+        ]
+      }
+    ],
     "PreToolUse": [
       {
         "matcher": "Bash",
         "hooks": [
-          {
-            "type": "command",
-            "command": "python \"${CLAUDE_PROJECT_DIR}/.claude/hooks/probe.py\"",
-            "timeout": 10
-          }
+          { "type": "command", "command": "python \"${CLAUDE_PROJECT_DIR}/hook.py\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read|WebFetch|Bash|Grep",
+        "hooks": [
+          { "type": "command", "command": "python \"${CLAUDE_PROJECT_DIR}/hook.py\"", "timeout": 10 }
         ]
       }
     ]

@@ -237,14 +237,14 @@ def installs(cmd):
 # --- provenance: where did the agent get this package or URL from? ---
 
 def new_state():
-    return {"trusted": set(), "tainted": {}}
+    return {"trusted": set(), "tainted": {}, "seen_hosts": set()}
 
 
 def load_state():
     try:
         with open(STATE, encoding="utf-8") as f:
             s = json.load(f)
-        return {"trusted": set(s["trusted"]), "tainted": s["tainted"]}
+        return {"trusted": set(s["trusted"]), "tainted": s["tainted"], "seen_hosts": set(s.get("seen_hosts", []))}
     except (OSError, ValueError, KeyError):
         return new_state()
 
@@ -255,7 +255,7 @@ def save_state(s):
         del t[k]
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     with open(STATE, "w", encoding="utf-8") as f:
-        json.dump({"trusted": sorted(s["trusted"]), "tainted": t}, f)
+        json.dump({"trusted": sorted(s["trusted"]), "tainted": t, "seen_hosts": sorted(s["seen_hosts"])}, f)
 
 
 def strings(o):
@@ -309,6 +309,42 @@ def provenance(item, state):
     return (7 if hit["injected"] else 3), why
 
 
+# --- item 6: irregular activity for an agent working inside a project ---
+NET_TOOL = r"\b(curl|wget|nc|ncat|netcat|scp|sftp|ftp|iwr|irm|invoke-webrequest|invoke-restmethod)\b"
+BEHAVIOR = [(label, pts, re.compile(rx, re.I)) for label, pts, rx in [
+    ("runs an encoded command", 8, r"\b(powershell|pwsh)(\.exe)?\b.*\s-(e|ec|enc|encodedcommand)\s+[A-Za-z0-9+/=]{16,}"
+                                   r"|base64\s+(-d|--decode)\b.*\|\s*(sh|bash|zsh|python3?|node)\b"),
+    ("downloads a file and then runs it", 6, NET_TOOL + r".*(&&|;|\n)\s*(sudo\s+)?(sh|bash|zsh|python3?|node|powershell|pwsh|chmod\s+\+x|start\s|\./)"),
+    ("runs a file from a temp or downloads folder", 3, r"(/tmp/|\$env:temp|%temp%|\$tmpdir|appdata[\\/]local[\\/]temp|[\\/]downloads[\\/])\S*\.(sh|exe|ps1|bat|cmd|py|js)\b"),
+    ("deletes outside the project", 8, r"\brm\s+-[a-z]*r[a-z]*\s+(/|~|\$home|c:[\\/]?)\*?(\s|$)|\bremove-item\b.*-recurse.*\s(c:\\|~|\$home)\s*$"),
+]]
+SENSITIVE = re.compile(r"\.ssh\b|id_rsa|id_ed25519|\.aws[\\/]credentials|\.npmrc|\.pypirc|\.git-credentials|\.docker[\\/]config\.json|\.kube[\\/]config|/etc/shadow|login data", re.I)
+KNOWN_HOSTS = {"github.com", "registry.npmjs.org", "pypi.org", "files.pythonhosted.org", "nodejs.org", "localhost", "127.0.0.1"}
+ASKED_FOR_SECRETS = {"ssh", ".ssh", "credentials", "aws", "secret", "secrets", "key", "keys", "token", "npmrc"}
+
+
+def hosts(cmd):
+    return {h for u in URL.findall(cmd) if (h := urlparse(u).hostname)}
+
+
+def novelty(cmd, state):
+    """Behaviour that is unusual for an agent in a project, even when no package is installed."""
+    results = [(f"behavior: {label}", pts, [f"`{m.group(0)[:50]}`"]) for label, pts, rx in BEHAVIOR if (m := rx.search(cmd))]
+    if m := SENSITIVE.search(cmd):
+        pts, why = 5, [f"touches credentials (`{m.group(0)}`)"]
+        if state["trusted"] & ASKED_FOR_SECRETS:
+            pts, why = 1, why + ["you mentioned keys or credentials, so only noted"]
+        if re.search(NET_TOOL, cmd, re.I):
+            pts, why = pts + 4, why + ["in the same command as a network tool"]
+        results.append(("behavior: credential access", pts, why))
+    for h in sorted(hosts(cmd) - state["seen_hosts"] - KNOWN_HOSTS):
+        if re.fullmatch(r"[\d.]+", h):
+            results.append((f"host: {h}", 3, ["contacts a raw IP address"]))
+        else:
+            results.append((f"host: {h}", 1, ["first contact with this host in this project"]))
+    return results
+
+
 def check_command(cmd, fetch=get, state=None):
     """Return [(item, score, reasons)] for everything risky or unverifiable in a shell command."""
     state = state or new_state()
@@ -326,7 +362,7 @@ def check_command(cmd, fetch=get, state=None):
         extra, why = provenance("url:" + u.rstrip(".,;:").lower(), state)
         if extra:
             results.append(("url:" + u, extra, why))
-    return results
+    return results + novelty(cmd, state)
 
 
 def main():
@@ -347,6 +383,9 @@ def main():
     cmd = data.get("tool_input", {}).get("command", "")
     results = check_command(cmd, state=state)
     bad = [r for r in results if r[1] >= DENY_AT]
+    if not bad and hosts(cmd) - state["seen_hosts"]:  # learn hosts only from allowed commands
+        state["seen_hosts"] |= hosts(cmd)
+        save_state(state)
     if results:
         os.makedirs(".spook", exist_ok=True)
         with open(".spook/ledger.jsonl", "a", encoding="utf-8") as f:

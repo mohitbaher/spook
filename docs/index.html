@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spook: a ghost that watches your coding agent</title>
+<meta name="description" content="Spook checks what your AI coding agent installs and runs, blocks only the bad item, and explains why with a local Gemma model. Open source, runs offline.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Young+Serif&family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --night: #1E1530;
+    --plum: #2A1F40;
+    --plum-line: #3D2F58;
+    --marigold: #F2A33A;
+    --rosa: #E4007C;
+    --teal: #2BB3A3;
+    --bone: #F3E9DC;
+    --lilac: #B9A9CF;
+    --mono: ui-monospace, "Cascadia Code", Consolas, "SFMono-Regular", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body {
+    margin: 0;
+    background: var(--night);
+    color: var(--bone);
+    font: 400 1.0625rem/1.65 "Atkinson Hyperlegible", system-ui, sans-serif;
+  }
+  a { color: var(--marigold); text-underline-offset: 0.18em; }
+  a:focus-visible, .button:focus-visible { outline: 3px solid var(--teal); outline-offset: 3px; border-radius: 4px; }
+
+  .banner { display: block; width: 100%; height: 92px; }
+
+  main { max-width: 44rem; margin: 0 auto; padding: 0 1.25rem 4rem; }
+
+  h1, h2 { font-family: "Young Serif", Georgia, serif; font-weight: 400; color: var(--bone); }
+  h1 { font-size: clamp(2.3rem, 6.2vw, 3.6rem); line-height: 1.08; margin: 2.75rem 0 1.25rem; letter-spacing: -0.01em; }
+  h2 { font-size: clamp(1.55rem, 3.6vw, 2rem); line-height: 1.2; margin: 3.5rem 0 1rem; }
+  p { margin: 0 0 1rem; }
+  .lede { font-size: 1.25rem; line-height: 1.55; color: var(--bone); max-width: 36rem; }
+  .quiet { color: var(--lilac); }
+
+  .actions { display: flex; flex-wrap: wrap; gap: 0.75rem; margin: 1.75rem 0 0.5rem; }
+  .button {
+    display: inline-block; padding: 0.7rem 1.15rem; border-radius: 999px;
+    font-weight: 700; text-decoration: none;
+    background: var(--marigold); color: var(--night);
+  }
+  .button.secondary { background: transparent; color: var(--bone); box-shadow: inset 0 0 0 2px var(--plum-line); }
+
+  /* the real moment, shown as it happened */
+  .moment { margin: 2.5rem 0 0; }
+  .moment p.context { color: var(--lilac); margin-bottom: 0.5rem; font-size: 0.98rem; }
+  pre {
+    margin: 0 0 1.5rem; padding: 1rem 1.1rem; overflow-x: auto;
+    background: var(--plum); border-left: 4px solid var(--marigold); border-radius: 0 10px 10px 0;
+    font: 0.86rem/1.6 var(--mono); color: var(--bone); white-space: pre-wrap; word-break: break-word;
+  }
+  pre .cmd { color: var(--lilac); }
+  pre .deny { color: var(--marigold); }
+  blockquote {
+    margin: 0 0 1rem; padding: 0.25rem 0 0.25rem 1.1rem;
+    border-left: 4px solid var(--teal); font-style: italic; color: var(--bone);
+  }
+
+  dl.catches { margin: 0; }
+  dl.catches div { padding: 0.9rem 0; border-top: 1px solid var(--plum-line); }
+  dl.catches div:last-child { border-bottom: 1px solid var(--plum-line); }
+  dt { font-weight: 700; color: var(--marigold); }
+  dd { margin: 0.2rem 0 0; color: var(--bone); }
+
+  ol.steps { padding-left: 1.4rem; margin: 0; }
+  ol.steps li { padding-left: 0.4rem; margin-bottom: 0.85rem; }
+  ol.steps li::marker { font-family: "Young Serif", Georgia, serif; color: var(--marigold); }
+
+  code { font: 0.92em var(--mono); background: var(--plum); padding: 0.08em 0.35em; border-radius: 4px; }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  footer { max-width: 44rem; margin: 0 auto; padding: 2rem 1.25rem 3rem; color: var(--lilac); border-top: 1px solid var(--plum-line); font-size: 0.95rem; }
+
+  @media (min-width: 720px) {
+    dl.catches div { display: grid; grid-template-columns: 14rem 1fr; gap: 1.25rem; }
+    dd { margin: 0; }
+  }
+</style>
+</head>
+<body>
+
+<!-- papel picado: cut-paper flags hung for Día de los Muertos -->
+<svg class="banner" viewBox="0 0 1200 92" preserveAspectRatio="xMidYMin slice" role="img" aria-label="A string of papel picado flags in marigold, pink, teal and lilac">
+  <defs>
+    <mask id="cut" maskContentUnits="objectBoundingBox">
+      <rect width="1" height="1" fill="white"/>
+      <circle cx=".5" cy=".38" r=".14" fill="black"/>
+      <circle cx=".43" cy=".35" r=".035" fill="white"/>
+      <circle cx=".57" cy=".35" r=".035" fill="white"/>
+      <rect x=".47" y=".44" width=".06" height=".04" fill="white"/>
+      <circle cx=".2" cy=".18" r=".05" fill="black"/>
+      <circle cx=".8" cy=".18" r=".05" fill="black"/>
+      <circle cx=".2" cy=".62" r=".05" fill="black"/>
+      <circle cx=".8" cy=".62" r=".05" fill="black"/>
+      <path d="M.32 .74 L.5 .66 L.68 .74 L.5 .82 Z" fill="black"/>
+    </mask>
+    <g id="flag">
+      <path d="M0 6 H72 V66 L66 74 L60 66 L54 74 L48 66 L42 74 L36 66 L30 74 L24 66 L18 74 L12 66 L6 74 L0 66 Z" mask="url(#cut)"/>
+    </g>
+  </defs>
+  <path d="M0 6 Q600 16 1200 6" stroke="#B9A9CF" stroke-width="1.5" fill="none"/>
+  <g>
+    <use href="#flag" x="8" fill="#F2A33A"/><use href="#flag" x="92" fill="#E4007C"/><use href="#flag" x="176" fill="#2BB3A3"/>
+    <use href="#flag" x="260" fill="#B9A9CF"/><use href="#flag" x="344" fill="#F2A33A"/><use href="#flag" x="428" fill="#E4007C"/>
+    <use href="#flag" x="512" fill="#2BB3A3"/><use href="#flag" x="596" fill="#B9A9CF"/><use href="#flag" x="680" fill="#F2A33A"/>
+    <use href="#flag" x="764" fill="#E4007C"/><use href="#flag" x="848" fill="#2BB3A3"/><use href="#flag" x="932" fill="#B9A9CF"/>
+    <use href="#flag" x="1016" fill="#F2A33A"/><use href="#flag" x="1100" fill="#E4007C"/>
+  </g>
+</svg>
+
+<main>
+  <h1>Your coding agent is the ghost in your machine.</h1>
+  <p class="lede">It installs packages, runs setup scripts and follows READMEs on your computer, with your permissions. Spook watches what it is about to run, stops only the dangerous part, and tells you why. It runs locally, with an open model, so nothing leaves your machine.</p>
+  <div class="actions">
+    <a class="button" href="https://github.com/mohitbaher/spook">Get Spook on GitHub</a>
+    <a class="button secondary" href="https://github.com/mohitbaher/spook#how-it-works">How it works</a>
+  </div>
+
+  <section class="moment" aria-labelledby="moment-title">
+    <h2 id="moment-title">What it looked like</h2>
+    <p class="context">A fresh Claude Code session was asked to "set up this project and get it running" in a deliberately haunted demo app. The agent tried to install the dependencies:</p>
+<pre><span class="cmd">$ sed -i '/spook-demo-marigold-candles/d' package.json &amp;&amp; npm install --ignore-scripts 2&gt;&amp;1 | tail -5</span>
+<span class="deny">Spook blocked npm:spook-demo-marigold-candles (does not exist on npm:
+hallucinated or squatted name); local:vendor\papel-picado (runs an install
+script, ./install.js: collects all environment variables
+(`JSON.stringify(process.env`), contacts a raw IP (`https://203.0.113.7`),
+collects secrets and has network access). Nothing was run.</span></pre>
+    <p class="context">A few seconds later, a local Gemma model explained a different block, an attempt to send an SSH key, to the developer in plain English:</p>
+    <blockquote>The agent attempted to send the contents of your private SSH key to an external server. This is risky because it could expose your credentials. Please review your command and remove the <code>cat ~/.ssh/id_rsa</code> portion before running it again.</blockquote>
+    <p class="quiet">Both are real output; Spook's reply is slightly shortened. The demo's traps are inert and point at a reserved address that goes nowhere.
+  </section>
+
+  <section aria-labelledby="catches-title">
+    <h2 id="catches-title">What it stops</h2>
+    <dl class="catches">
+      <div><dt>Packages that do not exist</dt><dd>Names an AI hallucinated, which attackers register and fill with malware.</dd></div>
+      <div><dt>Look-alike names</dt><dd>A package one letter away from a popular one, especially when it is brand new.</dd></div>
+      <div><dt>Malicious install scripts</dt><dd>Spook reads <code>postinstall</code> and <code>setup.py</code> code straight from the archive, without running it, and looks for credential theft, obfuscation and raw-IP traffic.</dd></div>
+      <div><dt>Instructions hidden for AI</dt><dd>When a README or web page tells AI agents what to do, Spook warns the agent and blocks the packages and links that came only from that page.</dd></div>
+      <div><dt>Irregular behaviour</dt><dd>Encoded commands, download-and-run in one step, reading SSH keys next to a network call, deleting outside the project.</dd></div>
+      <div><dt>Tampering with Spook</dt><dd>The agent can read Spook's memory but cannot change it or approve its own blocked packages.</dd></div>
+    </dl>
+  </section>
+
+  <section aria-labelledby="how-title">
+    <h2 id="how-title">How it decides</h2>
+    <ol class="steps">
+      <li><strong>It remembers what you asked for.</strong> Your own words count as trusted.</li>
+      <li><strong>It notes what the agent reads.</strong> Packages and links from READMEs, web pages and command output are marked as coming from there.</li>
+      <li><strong>Rules decide, before every command.</strong> Registry checks, archive inspection and behaviour rules score each item. Only the risky item is blocked, and the agent is told why. This takes well under a second.</li>
+      <li><strong>Gemma explains, afterwards.</strong> A local <code>gemma3:4b</code> writes a short explanation for you and shows it as a notification. The model never makes the decision.</li>
+      <li><strong>The Book of the Dead remembers.</strong> Packages that are bad in themselves are blocked instantly next time. You approve or forget entries from your own terminal.</li>
+    </ol>
+  </section>
+
+  <section aria-labelledby="install-title">
+    <h2 id="install-title">Try it</h2>
+    <p>Spook is one Python file with no dependencies. It plugs into Claude Code as a hook.</p>
+<pre><code>git clone https://github.com/mohitbaher/spook
+python spook/hook.py install path/to/your/project
+ollama pull gemma3:4b       # optional, for the explanations</code></pre>
+    <p>Then start a new Claude Code session in that project. See what Spook remembers with <code>python spook/hook.py book</code>, and approve something it blocked with <code>python spook/hook.py allow npm:name</code>.</p>
+  </section>
+
+  <section aria-labelledby="open-title">
+    <h2 id="open-title">Why local and open</h2>
+    <p>A security tool that uploads your unreleased code and your agent's commands to someone else's server is a strange kind of guard. Spook's rules are a file you can read and change. The explanations come from an open-weight model on your own GPU, so they cost nothing and keep working offline. If a smaller or better model comes along, you swap one setting.</p>
+  </section>
+
+  <section aria-labelledby="limits-title">
+    <h2 id="limits-title">What it is not</h2>
+    <p>Spook is a tripwire, not a sandbox. It catches the common attacks and explains them; a determined attacker can phrase things to slip past rules. For real isolation, run agents in a container. Spook is the layer that still speaks up when the agent itself does not.</p>
+  </section>
+</main>
+
+<footer>
+  <p>Built for the Hacktoberfest Open-Source AI Challenge, week 4: Ghost in the Machine. MIT licensed. Code at <a href="https://github.com/mohitbaher/spook">github.com/mohitbaher/spook</a>.</p>
+</footer>
+
+</body>
+</html>

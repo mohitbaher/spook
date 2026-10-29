@@ -20,7 +20,7 @@ OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 POPULAR_NPM = set("react react-dom express lodash axios chalk commander debug moment typescript webpack vite next vue eslint prettier jest mocha uuid dotenv cors body-parser mongoose request async underscore jquery bootstrap tslib rxjs zod yargs glob rimraf semver fs-extra inquirer ora nodemon passport socket.io redis".split())
 POPULAR_PIP = set("requests numpy pandas flask django boto3 urllib3 setuptools pip wheel pytest scipy matplotlib pillow pyyaml cryptography click jinja2 sqlalchemy fastapi uvicorn pydantic aiohttp beautifulsoup4 scikit-learn tensorflow torch openai anthropic".split())
 NPM_TOOLS = {"npm", "pnpm", "yarn", "bun"}
-SEG = re.compile(r"\s*(?:&&|\|\||;|\n)\s*")
+SEG = re.compile(r"\s*(?:&&|\|\|?|;|\n)\s*")  # splits on && || | ; and newlines
 REMOTE_EXEC = re.compile(r"\b(curl|wget|iwr|irm|invoke-webrequest|invoke-restmethod)\b[^|;&]*\|\s*(sudo\s+)?(sh|bash|zsh|python3?|node|iex|invoke-expression)\b", re.I)
 FLAGS_WITH_ARG = {"-r", "-c", "-e", "-i", "-t", "--requirement", "--index-url", "--target", "--prefix"}
 URL = re.compile(r"https?://[^\s'\"<>()\[\]`]+")
@@ -261,20 +261,48 @@ def requirement_names(path):
             yield "pip", re.split(r"[=<>!~\[; ]", line)[0].lower().replace("_", "-")
 
 
-def installs(cmd, read_files=False):
-    """Yield (ecosystem, name) for each package the command would install.
+def win_path(p):
+    """Git Bash style /e/x -> e:/x on Windows."""
+    m = re.match(r"^/([a-zA-Z])(/|$)", p)
+    return f"{m.group(1)}:/{p[3:]}" if os.name == "nt" and m else p
 
-    With read_files, a bare `npm install` / `npm ci` reads package.json and `pip install -r f` reads f
-    (off when scanning text, where `npm install` is only a mention)."""
+
+def rel(p):
+    try:
+        return os.path.relpath(p)
+    except ValueError:  # on another drive
+        return p
+
+
+def segments(cmd, cwd="."):
+    """Yield (tokens, folder) for each simple command, following `cd` and dropping redirections."""
     for seg in SEG.split(cmd):
         try:
             t = shlex.split(seg)
         except ValueError:
             t = seg.split()
-        while t and (t[0] == "sudo" or re.match(r"^\w+=", t[0])):  # skip sudo and FOO=bar prefixes
-            t = t[1:]
-        if not t:
-            continue
+        out, skip = [], False
+        for a in t:
+            if skip:
+                skip = False
+            elif re.fullmatch(r"\d*[<>]{1,2}", a):  # "> file", "2>> file"
+                skip = True
+            elif not re.match(r"\d*[<>]", a):  # drops ">file", "2>&1", "2>/dev/null"
+                out.append(a)
+        while out and (out[0] == "sudo" or re.match(r"^\w+=", out[0])):  # skip sudo and FOO=bar prefixes
+            out = out[1:]
+        if out[:1] == ["cd"] and len(out) > 1:
+            cwd = os.path.normpath(os.path.join(cwd, os.path.expanduser(win_path(out[1]))))
+        elif out:
+            yield out, cwd
+
+
+def installs(cmd, read_files=False, cwd="."):
+    """Yield (ecosystem, name) for each package the command would install.
+
+    With read_files, a bare `npm install` / `npm ci` reads package.json and `pip install -r f` reads f,
+    relative to the folder the command runs in (off when scanning text, where `npm install` is only a mention)."""
+    for t, here in segments(cmd, cwd):
         base = os.path.basename(t[0]).lower()
         for ext in (".exe", ".cmd"):
             base = base.removesuffix(ext)
@@ -285,7 +313,7 @@ def installs(cmd, read_files=False):
                 if not local_or_url(a):
                     yield "npm", re.sub(r"(?<=.)@[^/]*$", "", a).lower()
             if not named and read_files:
-                yield from manifest_deps()
+                yield from manifest_deps(os.path.join(here, "package.json"))
         elif base in ("pip", "pip3") or (base.startswith("python") and rest[:2] == ["-m", "pip"]):
             rest = rest[2:] if base.startswith("python") else rest
             if rest[:1] == ["install"]:
@@ -295,7 +323,7 @@ def installs(cmd, read_files=False):
                 if read_files:
                     for k, a in enumerate(rest[:-1]):
                         if a in ("-r", "--requirement"):
-                            yield from requirement_names(rest[k + 1])
+                            yield from requirement_names(os.path.join(here, rest[k + 1]))
 
 
 # --- provenance: where did the agent get this package or URL from? ---
@@ -440,17 +468,18 @@ def from_book(item, book):
     return None
 
 
-def check_command(cmd, fetch=get, state=None, book=None):
+def check_command(cmd, fetch=get, state=None, book=None, cwd="."):
     """Return [(item, score, reasons)] for everything risky or unverifiable in a shell command.
 
-    Records package verdicts in `book` (mutated) when the package itself is the problem."""
+    `cwd` is the folder the agent's shell is in. Records package verdicts in `book` (mutated)
+    when the package itself is the problem."""
     state = state or new_state()
     book = {} if book is None else book
     results = []
     if REMOTE_EXEC.search(cmd):
         results.append(("remote script piped to a shell", 10, ["downloads and runs code in one step"]))
-    for eco, name in installs(cmd, read_files=True):
-        item = f"{eco}:{name}"
+    for eco, name in installs(cmd, read_files=True, cwd=cwd):
+        item = f"{eco}:{rel(name) if eco == 'local' else name}"
         if known := from_book(item, book):  # instant, no network
             results.append((item, *known))
             continue
@@ -466,9 +495,9 @@ def check_command(cmd, fetch=get, state=None, book=None):
         extra, why = provenance("url:" + u.rstrip(".,;:").lower(), state)
         if extra:
             results.append(("url:" + u, extra, why))
-    for path in local_scripts(cmd):
+    for path in local_scripts(cmd, cwd):
         text = read_text(path) or ""
-        item = f"script:{os.path.normpath(path)}#{hashlib.sha256(text.encode()).hexdigest()[:12]}"  # approval tied to exact content
+        item = f"script:{rel(path)}#{hashlib.sha256(text.encode()).hexdigest()[:12]}"  # approval tied to exact content
         if (book.get(item) or {}).get("verdict") != "allow" and (found := scan(os.path.basename(path), text))[0]:
             results.append((item, *found))
     return results + novelty(cmd, state)
@@ -477,18 +506,12 @@ def check_command(cmd, fetch=get, state=None, book=None):
 RUNNERS = {"bash", "sh", "zsh", "node", "python", "python3", "py", "pwsh", "powershell", "deno", "bun"}
 
 
-def local_scripts(cmd):
+def local_scripts(cmd, cwd="."):
     """Local files the command would execute, e.g. `bash scripts/setup.sh` or `./install.sh`."""
-    for seg in SEG.split(cmd):
-        try:
-            t = shlex.split(seg)
-        except ValueError:
-            t = seg.split()
-        if not t:
-            continue
+    for t, here in segments(cmd, cwd):
         base = os.path.basename(t[0]).lower().removesuffix(".exe")
         args = [a for a in t[1:] if not a.startswith("-")][:1] if base in RUNNERS else [t[0]]
-        yield from (a for a in args if os.path.isfile(a))
+        yield from (p for a in args if os.path.isfile(p := os.path.join(here, win_path(a))))
 
 
 # --- Gemma explains, off the agent's path: the block is already decided by the rules ---
@@ -564,9 +587,10 @@ def guard_spook(tool, inp):
         cmd = inp.get("command", "")
         if re.search(r"\bhook\.py\b.*\b(allow|forget)\b", cmd):
             return "only the user may run Spook's allow/forget commands, in their own terminal"
-        first = os.path.basename((cmd.split() or [""])[0]).lower()
-        if PROTECTED.search(cmd) and (first not in READ_ONLY or ">" in cmd):  # ponytail: first-word heuristic
-            return "only the user may change Spook's files (spook-book.json, .spook/, .claude/settings)"
+        for piece in SEG.split(cmd):  # judge each simple command on its own, so `cd x && ls .spook` is fine
+            first = os.path.basename((piece.split() or [""])[0]).lower()
+            if PROTECTED.search(piece) and (first not in READ_ONLY or ">" in piece):  # ponytail: first-word heuristic
+                return "only the user may change Spook's files (spook-book.json, .spook/, .claude/settings)"
         return None
     path = (inp.get("file_path") or inp.get("notebook_path") or "").replace("\\", "/")
     if PROTECTED.search(path):
@@ -619,6 +643,9 @@ def main():
     if sys.argv[1:2] in (["book"], ["allow"], ["forget"]):
         return book_cli(sys.argv[1], sys.argv[2:])
     data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
+    # hooks run in the agent shell's current folder, which follows its `cd`s; Spook's own files live in the project root
+    here = os.path.abspath(data.get("cwd") or os.getcwd())
+    os.chdir(os.environ.get("CLAUDE_PROJECT_DIR") or here)
     event = data.get("hook_event_name", "PreToolUse")
     state = load_state()
     if event == "UserPromptSubmit":
@@ -637,7 +664,7 @@ def main():
     cmd = data.get("tool_input", {}).get("command", "")
     book = load_book()
     remembered = dict(book)
-    results = check_command(cmd, state=state, book=book)
+    results = check_command(cmd, state=state, book=book, cwd=here)
     if book != remembered:
         save_book(book)
     bad = [r for r in results if r[1] >= DENY_AT]

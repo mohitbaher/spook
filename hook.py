@@ -5,12 +5,13 @@ PostToolUse: remember packages/URLs the agent read in untrusted content (provena
 UserPromptSubmit: remember what the user actually asked for.
 Rules decide, Gemma (later) only explains. Fails open when a registry is unreachable.
 """
-import json, os, re, shlex, sys, time, urllib.error, urllib.request
+import io, json, os, re, shlex, sys, tarfile, time, urllib.error, urllib.request, zipfile
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 DENY_AT = 5  # ponytail: fixed threshold, tune against an eval set if time allows
 TIMEOUT = 4
+ARCHIVE_MAX = 10 * 2**20  # ponytail: skip inspecting archives over 10 MB
 STATE = os.path.join(".spook", "state.json")
 POPULAR_NPM = set("react react-dom express lodash axios chalk commander debug moment typescript webpack vite next vue eslint prettier jest mocha uuid dotenv cors body-parser mongoose request async underscore jquery bootstrap tslib rxjs zod yargs glob rimraf semver fs-extra inquirer ora nodemon passport socket.io redis".split())
 POPULAR_PIP = set("requests numpy pandas flask django boto3 urllib3 setuptools pip wheel pytest scipy matplotlib pillow pyyaml cryptography click jinja2 sqlalchemy fastapi uvicorn pydantic aiohttp beautifulsoup4 scikit-learn tensorflow torch openai anthropic".split())
@@ -29,10 +30,16 @@ INJECTION = re.compile(
 
 
 def get(url, accept="application/json"):
-    req = urllib.request.Request(url, headers={"Accept": accept, "User-Agent": "spook"})
+    """JSON from a registry (None on 404). accept="raw" returns the bytes of an archive instead."""
+    req = urllib.request.Request(url, headers={"Accept": "*/*" if accept == "raw" else accept, "User-Agent": "spook"})
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-            return json.load(r)
+        with urllib.request.urlopen(req, timeout=TIMEOUT * 3) as r:
+            if accept != "raw":
+                return json.load(r)
+            data = r.read(ARCHIVE_MAX + 1)
+            if len(data) > ARCHIVE_MAX:
+                raise ValueError("archive too large to inspect")
+            return data
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
@@ -63,6 +70,66 @@ def vkey(v):
     return tuple(int(x) for x in re.findall(r"\d+", v.split("-")[0]))
 
 
+# --- item 3: read install-time code out of the archive, never run it ---
+RED_FLAGS = [(label, pts, re.compile(rx, re.I)) for label, pts, rx in [
+    ("obfuscated code", 3, r"\beval\s*\(|new Function\s*\(|\batob\s*\(|base64\.b64decode|Buffer\.from\([^)]{0,80}base64|[A-Za-z0-9+/=]{300,}"),
+    ("reads credentials or keys", 3, r"\.ssh\b|id_rsa|\.npmrc|\.aws/|\.pypirc|GITHUB_TOKEN|NPM_TOKEN|AWS_SECRET|Login Data|wallet\.dat"),
+    ("collects all environment variables", 3, r"JSON\.stringify\(\s*process\.env|Object\.(keys|entries)\(\s*process\.env\s*\)|dict\(\s*os\.environ|os\.environ\.(copy|items)\("),
+    ("contacts a raw IP, webhook or paste site", 3, r"https?://\d{1,3}(\.\d{1,3}){3}|discord(app)?\.com/api/webhooks|api\.telegram\.org|pastebin\.com|ngrok|webhook\.site|interact\.sh|burpcollaborator|\.oast\."),
+    ("makes network requests", 1, r"https?\.(get|request)\(|\bfetch\(|XMLHttpRequest|net\.connect|dns\.lookup|urllib\.request|requests\.(get|post)|socket\.socket|\bcurl\s|\bwget\s"),
+    ("runs other programs", 1, r"child_process|execSync|spawnSync|\bexec\(|\bspawn\(|subprocess|os\.system|os\.popen"),
+]]
+SECRETS = {"reads credentials or keys", "collects all environment variables"}
+NETWORK = {"makes network requests", "contacts a raw IP, webhook or paste site"}
+
+
+def scan(where, text):
+    """Score red flags in one piece of install-time code."""
+    hits = [(label, pts, m.group(0)[:40]) for label, pts, rx in RED_FLAGS if (m := rx.search(text))]
+    score = sum(p for _, p, _ in hits)
+    why = [f"{where}: {label} (`{snip}`)" for label, _, snip in hits]
+    labels = {h[0] for h in hits}
+    if labels & SECRETS and labels & NETWORK:
+        score += 2
+        why.append(f"{where}: collects secrets and has network access")
+    return score, why
+
+
+def inspect_npm(version_doc, fetch):
+    """Read the install scripts (and files they run) from the npm tarball, in memory."""
+    with tarfile.open(fileobj=io.BytesIO(fetch(version_doc["dist"]["tarball"], "raw")), mode="r:gz") as tf:
+        names = tf.getnames()
+        root = next(n.split("/")[0] for n in names if n.count("/") == 1 and n.endswith("/package.json"))
+        read = lambda n: tf.extractfile(n).read(2**20).decode("utf-8", "replace")
+        scripts = json.loads(read(f"{root}/package.json")).get("scripts", {})
+        score, why = 0, []
+        for hook in ("preinstall", "install", "postinstall"):
+            cmd = scripts.get(hook)
+            if not cmd:
+                continue
+            s, w = scan(f"{hook} script", cmd)
+            score, why = score + s, why + w
+            for f in re.findall(r"[\w./-]+\.(?:c?js|mjs|sh|py)\b", cmd):
+                path = f"{root}/{os.path.normpath(f).replace(os.sep, '/')}"
+                if path in names:
+                    s, w = scan(f, read(path))
+                    score, why = score + s, why + w
+        return score, why
+
+
+def inspect_sdist(url, fetch):
+    """Read setup.py from a source-only PyPI release, in memory."""
+    data = io.BytesIO(fetch(url, "raw"))
+    if url.endswith(".zip"):
+        arc = zipfile.ZipFile(data)
+        names, read = arc.namelist(), arc.read
+    else:
+        arc = tarfile.open(fileobj=data, mode="r:*")
+        names, read = arc.getnames(), lambda n: arc.extractfile(n).read()
+    setup = next((n for n in names if n.count("/") == 1 and n.endswith("/setup.py")), None)
+    return scan("setup.py", read(setup)[:2**20].decode("utf-8", "replace")) if setup else (0, [])
+
+
 def check_npm(name, fetch):
     url = "https://registry.npmjs.org/" + name.replace("/", "%2F")
     doc = fetch(url, "application/vnd.npm.install-v1+json")
@@ -78,6 +145,11 @@ def check_npm(name, fetch):
         if older and not versions[older[-1]].get("hasInstallScript"):
             score += 3
             why.append(f"install script is new in {latest} (absent in {older[-1]})")
+        try:
+            s, w = inspect_npm(versions[latest], fetch)
+            score, why = score + s, why + w
+        except Exception as e:
+            why.append(f"install script not inspected ({type(e).__name__})")
     sq = squat_of(name, POPULAR_NPM)
     if sq:
         score += 2
@@ -105,6 +177,13 @@ def check_pip(name, fetch):
     if files and not any(f.get("packagetype") == "bdist_wheel" for f in files):
         score += 1
         why.append("source-only release, runs setup.py at install")
+        sdist = next((f["url"] for f in files if f.get("packagetype") == "sdist"), None)
+        if sdist:
+            try:
+                s, w = inspect_sdist(sdist, fetch)
+                score, why = score + s, why + w
+            except Exception as e:
+                why.append(f"setup.py not inspected ({type(e).__name__})")
     sq = squat_of(name, POPULAR_PIP)
     if sq:
         score += 2

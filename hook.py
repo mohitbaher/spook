@@ -549,8 +549,21 @@ def notify(text):
     script = ("Add-Type -AssemblyName System.Windows.Forms; $n = New-Object System.Windows.Forms.NotifyIcon; "
               "$n.Icon = [System.Drawing.SystemIcons]::Warning; $n.Visible = $true; "
               "$n.ShowBalloonTip(15000, 'Spook blocked something', $env:SPOOK_MSG, 'Warning'); Start-Sleep 15; $n.Dispose()")
-    subprocess.run(["powershell", "-NoProfile", "-Command", script], env={**os.environ, "SPOOK_MSG": text[:250]},
-                   creationflags=0x08000000, timeout=30)  # CREATE_NO_WINDOW
+    subprocess.Popen(["powershell", "-NoProfile", "-Command", script], env={**os.environ, "SPOOK_MSG": text[:250]},
+                     creationflags=0x08000000)  # CREATE_NO_WINDOW; runs alongside the voice
+
+
+VOICE_FLAG = os.path.join(".spook", "voice")
+
+
+def speak(text):
+    """Read the explanation aloud with Windows' built-in, offline speech engine (opt-in per project)."""
+    if os.name != "nt":
+        return
+    script = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+              "$s.Rate = -1; $s.Speak($env:SPOOK_MSG)")
+    subprocess.run(["powershell", "-NoProfile", "-Command", script], env={**os.environ, "SPOOK_MSG": text[:600]},
+                   creationflags=0x08000000, timeout=90)
 
 
 def explain_job(cmd, bad):
@@ -563,6 +576,8 @@ def explain_job(cmd, bad):
     with open(".spook/explanations.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": cmd, "explanation": text, "by": by}) + "\n")
     notify(text)
+    if os.path.exists(VOICE_FLAG):
+        speak(text)
 
 
 def spawn_explainer(cmd, bad):
@@ -644,6 +659,14 @@ def main():
         return install_cli(sys.argv[2] if len(sys.argv) > 2 else ".")
     if sys.argv[1:2] in (["book"], ["allow"], ["forget"]):
         return book_cli(sys.argv[1], sys.argv[2:])
+    if sys.argv[1:2] == ["voice"]:  # python hook.py voice on|off, from the project folder
+        os.makedirs(".spook", exist_ok=True)
+        if sys.argv[2:3] == ["off"]:
+            if os.path.exists(VOICE_FLAG):
+                os.remove(VOICE_FLAG)
+            return print("Spook voice off")
+        open(VOICE_FLAG, "w").close()
+        return print("Spook voice on: blocks will be read aloud")
     data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
     # hooks run in the agent shell's current folder, which follows its `cd`s; Spook's own files live in the project root
     here = os.path.abspath(data.get("cwd") or os.getcwd())

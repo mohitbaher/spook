@@ -51,6 +51,8 @@ python path/to/spook/hook.py allow npm:some-package  # approve something it bloc
 python path/to/spook/hook.py forget npm:some-package
 ```
 
+To have blocks read aloud (Windows' built-in, offline speech engine), run `python path/to/spook/hook.py voice on` in the project folder; `voice off` turns it off.
+
 Use another local model with `SPOOK_MODEL` (for example `gemma3:1b`) and another Ollama host with `OLLAMA_HOST`.
 
 ## Demo: the Haunted Ofrenda

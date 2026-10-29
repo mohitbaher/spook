@@ -578,7 +578,8 @@ def spawn_explainer(cmd, bad):
 
 # --- only the user may change Spook's memory: an agent that could would allow-list its own malware ---
 PROTECTED = re.compile(r"spook-book\.json|(^|[\s\\/'\"])\.spook\b|\.claude[\\/]settings(\.local)?\.json", re.I)
-READ_ONLY = {"cat", "type", "get-content", "gc", "head", "tail", "less", "more", "grep", "rg", "findstr", "ls", "dir", "wc", "jq"}
+READ_ONLY = {"cat", "type", "get-content", "gc", "head", "tail", "less", "more", "grep", "rg", "findstr", "ls", "dir", "wc", "jq",
+             "find", "stat", "tree", "file", "du", "get-childitem", "gci", "sha256sum", "md5sum"}
 
 
 def guard_spook(tool, inp):
@@ -589,7 +590,8 @@ def guard_spook(tool, inp):
             return "only the user may run Spook's allow/forget commands, in their own terminal"
         for piece in SEG.split(cmd):  # judge each simple command on its own, so `cd x && ls .spook` is fine
             first = os.path.basename((piece.split() or [""])[0]).lower()
-            if PROTECTED.search(piece) and (first not in READ_ONLY or ">" in piece):  # ponytail: first-word heuristic
+            writes = ">" in piece or re.search(r"\s-(delete|exec|execdir|ok)\b", piece)  # find can write too
+            if PROTECTED.search(piece) and (first not in READ_ONLY or writes):  # ponytail: first-word heuristic
                 return "only the user may change Spook's files (spook-book.json, .spook/, .claude/settings)"
         return None
     path = (inp.get("file_path") or inp.get("notebook_path") or "").replace("\\", "/")

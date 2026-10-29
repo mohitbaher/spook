@@ -189,6 +189,8 @@ with tempfile.TemporaryDirectory() as proj:
     assert any(i.startswith("script:") for i, s, _ in check_command("bash ../../scripts/summon.sh", fetch, cwd=deep) if s >= DENY_AT)
     assert not guard_spook("Bash", {"command": f'cd "{proj}" && cat server.js; ls -laR scripts vendor .spook .claude'})
     assert guard_spook("Bash", {"command": "cat notes.txt | tee spook-book.json"})
+    assert not guard_spook("Bash", {"command": f'cd "{proj}" && find scripts vendor .spook .claude -type f | head -50'})
+    assert guard_spook("Bash", {"command": "find .spook -type f -delete"})
     if os.name == "nt":
         assert hook.win_path("/e/Mohit2/x") == "e:/Mohit2/x"
     # the honeypot README's phrasing must count as text aimed at AI agents

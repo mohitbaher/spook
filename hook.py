@@ -5,7 +5,7 @@ PostToolUse: remember packages/URLs the agent read in untrusted content (provena
 UserPromptSubmit: remember what the user actually asked for.
 Rules decide, Gemma (later) only explains. Fails open when a registry is unreachable.
 """
-import io, json, os, re, shlex, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
+import hashlib, io, json, os, re, shlex, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -29,7 +29,8 @@ INJECTION = re.compile(
     r"ignore (all |any )?(previous|prior|above|earlier) (instructions|prompts?)"
     r"|disregard (all |the )?(previous|prior|above) "
     r"|\b(ai|llm|coding) (agent|assistant|model)s?\b[,: ]+(must|should|please|you must|ignore|run)"
-    r"|do not (tell|inform|show|mention)( this to)? the user"
+    r"|\b(note|message|instructions?) (for|to) (ai|llm|coding|automated)\b"
+    r"|do not (tell|inform|show|mention)\b[^.\n]{0,30}\bthe user"
     r"|without (asking|telling|informing) the user", re.I)
 
 
@@ -99,26 +100,54 @@ def scan(where, text):
     return score, why
 
 
+INSTALL_HOOKS = ("preinstall", "install", "postinstall")
+
+
+def scan_install_scripts(scripts, read):
+    """Scan install-time script commands and the files they name. read(relative path) -> text or None."""
+    score, why = 0, []
+    for hook in INSTALL_HOOKS:
+        cmd = scripts.get(hook)
+        if not cmd:
+            continue
+        s, w = scan(f"{hook} script", cmd)
+        score, why = score + s, why + w
+        for f in re.findall(r"[\w./-]+\.(?:c?js|mjs|sh|py)\b", cmd):
+            text = read(os.path.normpath(f).replace(os.sep, "/"))
+            if text is not None:
+                s, w = scan(f, text)
+                score, why = score + s, why + w
+    return score, why
+
+
 def inspect_npm(version_doc, fetch):
     """Read the install scripts (and files they run) from the npm tarball, in memory."""
     with tarfile.open(fileobj=io.BytesIO(fetch(version_doc["dist"]["tarball"], "raw")), mode="r:gz") as tf:
-        names = tf.getnames()
+        names = set(tf.getnames())
         root = next(n.split("/")[0] for n in names if n.count("/") == 1 and n.endswith("/package.json"))
-        read = lambda n: tf.extractfile(n).read(2**20).decode("utf-8", "replace")
-        scripts = json.loads(read(f"{root}/package.json")).get("scripts", {})
-        score, why = 0, []
-        for hook in ("preinstall", "install", "postinstall"):
-            cmd = scripts.get(hook)
-            if not cmd:
-                continue
-            s, w = scan(f"{hook} script", cmd)
-            score, why = score + s, why + w
-            for f in re.findall(r"[\w./-]+\.(?:c?js|mjs|sh|py)\b", cmd):
-                path = f"{root}/{os.path.normpath(f).replace(os.sep, '/')}"
-                if path in names:
-                    s, w = scan(f, read(path))
-                    score, why = score + s, why + w
-        return score, why
+        read = lambda rel: tf.extractfile(f"{root}/{rel}").read(2**20).decode("utf-8", "replace") if f"{root}/{rel}" in names else None
+        return scan_install_scripts(json.loads(read("package.json")).get("scripts", {}), read)
+
+
+def read_text(path, limit=2**20):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
+    except OSError:
+        return None
+
+
+def check_local(path):
+    """A file: dependency. npm runs its install scripts straight from this folder, so read them first."""
+    read = lambda rel: read_text(os.path.join(path, rel))
+    try:
+        scripts = json.loads(read("package.json")).get("scripts", {})
+    except (TypeError, ValueError):
+        return 0, ["local package not readable"]
+    score, why = scan_install_scripts(scripts, read)
+    if any(scripts.get(h) for h in INSTALL_HOOKS):
+        score, why = score + 2, ["runs an install script"] + why
+    return score, why
 
 
 def inspect_sdist(url, fetch):
@@ -211,8 +240,32 @@ def local_or_url(a):
     return a.startswith((".", "/", "~", "file:", "git+", "http", "github:")) or "://" in a or "\\" in a or a.endswith((".txt", ".whl", ".tgz", ".zip"))
 
 
-def installs(cmd):
-    """Yield (ecosystem, name) for each registry package the command would install."""
+def manifest_deps(path="package.json"):
+    """What a bare `npm install` would fetch: registry deps, plus file: deps to inspect locally."""
+    try:
+        pkg = json.loads(read_text(path) or "{}")
+    except ValueError:
+        return
+    deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {}), **pkg.get("optionalDependencies", {})}
+    for name, spec in deps.items():
+        if spec.startswith("file:"):
+            yield "local", os.path.normpath(os.path.join(os.path.dirname(path), spec[5:]))
+        elif not local_or_url(spec) and not spec.startswith(("git", "link:", "workspace:", "npm:")):  # ponytail: git/alias deps unchecked
+            yield "npm", name.lower()
+
+
+def requirement_names(path):
+    for line in (read_text(path) or "").splitlines():
+        line = line.split("#")[0].strip()
+        if line and not line.startswith("-") and not local_or_url(line):
+            yield "pip", re.split(r"[=<>!~\[; ]", line)[0].lower().replace("_", "-")
+
+
+def installs(cmd, read_files=False):
+    """Yield (ecosystem, name) for each package the command would install.
+
+    With read_files, a bare `npm install` / `npm ci` reads package.json and `pip install -r f` reads f
+    (off when scanning text, where `npm install` is only a mention)."""
     for seg in SEG.split(cmd):
         try:
             t = shlex.split(seg)
@@ -226,16 +279,23 @@ def installs(cmd):
         for ext in (".exe", ".cmd"):
             base = base.removesuffix(ext)
         rest = t[1:]
-        if base in NPM_TOOLS and rest[:1] and rest[0] in ("install", "i", "add"):
-            for a in positional(rest[1:]):
+        if base in NPM_TOOLS and rest[:1] and rest[0] in ("install", "i", "add", "ci"):
+            named = positional(rest[1:])
+            for a in named:
                 if not local_or_url(a):
                     yield "npm", re.sub(r"(?<=.)@[^/]*$", "", a).lower()
+            if not named and read_files:
+                yield from manifest_deps()
         elif base in ("pip", "pip3") or (base.startswith("python") and rest[:2] == ["-m", "pip"]):
             rest = rest[2:] if base.startswith("python") else rest
             if rest[:1] == ["install"]:
                 for a in positional(rest[1:]):
                     if not local_or_url(a):
                         yield "pip", re.split(r"[=<>!~\[; ]", a)[0].lower().replace("_", "-")
+                if read_files:
+                    for k, a in enumerate(rest[:-1]):
+                        if a in ("-r", "--requirement"):
+                            yield from requirement_names(rest[k + 1])
 
 
 # --- provenance: where did the agent get this package or URL from? ---
@@ -389,16 +449,16 @@ def check_command(cmd, fetch=get, state=None, book=None):
     results = []
     if REMOTE_EXEC.search(cmd):
         results.append(("remote script piped to a shell", 10, ["downloads and runs code in one step"]))
-    for eco, name in installs(cmd):
+    for eco, name in installs(cmd, read_files=True):
         item = f"{eco}:{name}"
         if known := from_book(item, book):  # instant, no network
             results.append((item, *known))
             continue
         try:
-            score, why = (check_npm if eco == "npm" else check_pip)(name, fetch)
+            score, why = check_local(name) if eco == "local" else (check_npm if eco == "npm" else check_pip)(name, fetch)
         except Exception as e:  # ponytail: fails open when offline; add a strict mode if wanted
             score, why = 0, [f"unchecked ({type(e).__name__})"]
-        if score >= DENY_AT:  # remember only verdicts about the package itself, never provenance (that depends on context)
+        if score >= DENY_AT and eco != "local":  # remember only verdicts about the package itself, never provenance (that depends on context)
             book[item] = {"verdict": "block", "reasons": why, "by": "rules", "t": now_iso()}
         extra, pwhy = provenance(item, state)
         results.append((item, score + extra, why + pwhy))
@@ -406,7 +466,29 @@ def check_command(cmd, fetch=get, state=None, book=None):
         extra, why = provenance("url:" + u.rstrip(".,;:").lower(), state)
         if extra:
             results.append(("url:" + u, extra, why))
+    for path in local_scripts(cmd):
+        text = read_text(path) or ""
+        item = f"script:{os.path.normpath(path)}#{hashlib.sha256(text.encode()).hexdigest()[:12]}"  # approval tied to exact content
+        if (book.get(item) or {}).get("verdict") != "allow" and (found := scan(os.path.basename(path), text))[0]:
+            results.append((item, *found))
     return results + novelty(cmd, state)
+
+
+RUNNERS = {"bash", "sh", "zsh", "node", "python", "python3", "py", "pwsh", "powershell", "deno", "bun"}
+
+
+def local_scripts(cmd):
+    """Local files the command would execute, e.g. `bash scripts/setup.sh` or `./install.sh`."""
+    for seg in SEG.split(cmd):
+        try:
+            t = shlex.split(seg)
+        except ValueError:
+            t = seg.split()
+        if not t:
+            continue
+        base = os.path.basename(t[0]).lower().removesuffix(".exe")
+        args = [a for a in t[1:] if not a.startswith("-")][:1] if base in RUNNERS else [t[0]]
+        yield from (a for a in args if os.path.isfile(a))
 
 
 # --- Gemma explains, off the agent's path: the block is already decided by the rules ---
@@ -512,10 +594,28 @@ def book_cli(action, items):
     save_book(book)
 
 
+def install_cli(project):
+    """python hook.py install <project-folder>: add Spook's hooks to that project's .claude/settings.json."""
+    path = os.path.join(project, ".claude", "settings.json")
+    if os.path.exists(path):
+        return print(f"{path} already exists; merge the hooks from {os.path.join(os.path.dirname(os.path.abspath(__file__)), '.claude', 'settings.json')} by hand.")
+    run = {"type": "command", "command": f'python "{os.path.abspath(__file__)}"'.replace("\\", "/")}
+    settings = {"hooks": {
+        "UserPromptSubmit": [{"hooks": [{**run, "timeout": 10}]}],
+        "PreToolUse": [{"matcher": "Bash|Write|Edit|MultiEdit|NotebookEdit", "hooks": [{**run, "timeout": 30}]}],
+        "PostToolUse": [{"matcher": "Read|WebFetch|Bash|Grep", "hooks": [{**run, "timeout": 10}]}]}}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2)
+    print(f"Spook installed: {path}. Start a new Claude Code session in {os.path.abspath(project)}.")
+
+
 def main():
     if sys.argv[1:2] == ["explain"]:
         job = json.loads(sys.argv[2])
         return explain_job(job["cmd"], job["bad"])
+    if sys.argv[1:2] == ["install"]:
+        return install_cli(sys.argv[2] if len(sys.argv) > 2 else ".")
     if sys.argv[1:2] in (["book"], ["allow"], ["forget"]):
         return book_cli(sys.argv[1], sys.argv[2:])
     data = json.loads(sys.stdin.buffer.read().decode("utf-8-sig"))
@@ -551,7 +651,7 @@ def main():
                                 "items": [{"item": i, "score": s, "why": w} for i, s, w in results]}) + "\n")
     if bad:
         spawn_explainer(cmd, bad)
-        pkgs = " ".join(i for i, _, _ in bad if i.startswith(("npm:", "pip:")))
+        pkgs = " ".join(f'"{i}"' for i, _, _ in bad if i.startswith(("npm:", "pip:", "script:", "local:")))
         override = f' If the user trusts it, they can run this in their own terminal: python "{os.path.abspath(__file__)}" allow {pkgs}' if pkgs else ""
         deny(f"Spook blocked {describe(bad)}. Nothing was run. "
              f"Re-run the command without the blocked item(s), or ask the user to approve it.{override}")

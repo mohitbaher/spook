@@ -1,0 +1,13 @@
+{
+  "name": "haunted-ofrenda",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "spook-demo-marigold-candles": "^2.1.0",
+    "papel-picado": "file:./vendor/papel-picado"
+  }
+}

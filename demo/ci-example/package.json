@@ -1,0 +1,9 @@
+{
+  "name": "lantern-walk",
+  "private": true,
+  "description": "Example for Spook's pull-request check: an agent-suggested dependency list with one name that does not exist.",
+  "dependencies": {
+    "express": "^4.21.0",
+    "spook-demo-moonlit-lanterns": "^1.0.0"
+  }
+}

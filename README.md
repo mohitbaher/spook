@@ -73,7 +73,6 @@ Copy [`.env.example`](.env.example) to `.env` next to `hook.py` (it is gitignore
 |---|---|---|
 | `SPOOK_SENTRY_DSN` (`pip install sentry-sdk`) | Traces every check as an AI agent run in Sentry: one `execute_tool` span per package, registry lookups, and the explainer's `gen_ai.chat` span with Gemma's token counts, all in one trace. | Item names, scores, reasons, timings, token counts. Never the command, prompts, answers or code (the SDK's own copies of the command are scrubbed). |
 | `SPOOK_MONGODB_URI` (`pip install pymongo`) | A **shared Book of the Dead** for a team, in MongoDB Atlas. Before checking a command, Spook asks whether a teammate already blocked its packages; new package blocks are shared by the background worker. `python hook.py sync` shares and pulls everything. Short timeouts: if Atlas is slow, Spook checks normally. | npm/PyPI package names, the rule reasons, times, and an anonymous id per reporter. Never commands, local paths, scripts, code or your allow decisions. |
-| `BACKBOARD_API_KEY` | `python compare_models.py` runs the demo's six block cases through local Gemma and open-weight models behind one Backboard key, and writes `bench/results.md` (exact names kept, length, latency, tokens, cost). | Only the six demo cases written in the script. |
 
 The explanation itself always comes from your local model.
 

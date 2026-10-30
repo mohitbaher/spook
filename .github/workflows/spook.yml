@@ -1,0 +1,32 @@
+# Spook in CI: when a pull request changes a dependency manifest, check every dependency in it
+# (registry existence, look-alike names, age, install scripts read as text) and comment the result.
+name: Spook dependency check
+
+on:
+  pull_request:
+    paths: ["**/package.json", "**/requirements*.txt"]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  spook:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check changed manifests
+        shell: bash
+        run: |
+          changed=$(git diff --name-only "origin/${{ github.base_ref }}...HEAD" -- '*package.json' '*requirements*.txt' | grep -v node_modules || true)
+          python hook.py ci $changed | tee spook-report.md
+      - name: Comment on the pull request
+        if: always() && hashFiles('spook-report.md') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment "${{ github.event.pull_request.number }}" --body-file spook-report.md --edit-last || gh pr comment "${{ github.event.pull_request.number }}" --body-file spook-report.md

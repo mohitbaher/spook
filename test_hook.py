@@ -200,5 +200,35 @@ with tempfile.TemporaryDirectory() as proj:
         assert not taint(new_state(), {"tool_name": "Read", "tool_input": {"file_path": "README.md"}, "tool_response": doc}), doc
     hook.install_cli("target")
     assert json.load(open("target/.claude/settings.json"))["hooks"]["PreToolUse"][0]["matcher"].startswith("Bash")
+    # CI mode: a pull request adding a hallucinated package fails; a clean manifest passes
+    with open("package.json", "w") as f:
+        json.dump({"dependencies": {"express": "^4.0.0", "spook-made-up-pkg": "1.0.0"}}, f)
+    with open("requirements.txt", "w") as f:
+        f.write("requests==2.0\n")
+    assert hook.ci_cli([], fetch=fetch) == 1
+    assert hook.ci_cli(["requirements.txt"], fetch=fetch) == 0
+
+    # shared Book of the Dead: a teammate's block arrives before any network check; only package blocks leave
+    class FakeShared:
+        docs = {"npm:team-found-this": {"_id": "npm:team-found-this", "verdict": "block", "reasons": ["install script steals keys"],
+                                        "t": now_iso(), "reporters": ["a1", "b2"]}}
+        sent = []
+        def find(self, q):
+            ids = q.get("_id", {}).get("$in")
+            return [d for k, d in self.docs.items() if ids is None or k in ids]
+        def bulk_write(self, ops):
+            self.sent += [op._filter["_id"] for op in ops]
+    shared, book = FakeShared(), {}
+    hook.pull_shared(["npm:team-found-this", "npm:express", "local:vendor/x"], book, shared)
+    assert book["npm:team-found-this"]["by"] == "shared (2 reporters)"
+    assert "shared Book of the Dead" in hook.from_book("npm:team-found-this", book)[1][0]
+    try:
+        import pymongo  # optional dependency; skip the push check without it
+        hook.push_shared({**book, "npm:mine": {"verdict": "block", "reasons": ["x"], "t": now_iso(), "by": "rules"},
+                          "local:vendor/x": {"verdict": "block", "reasons": ["x"], "t": now_iso(), "by": "rules"},
+                          "npm:ok": {"verdict": "allow", "reasons": [], "t": now_iso(), "by": "user"}}, shared)
+        assert shared.sent == ["npm:mine"], shared.sent  # not the teammate's entry, not local paths, not allows
+    except ImportError:
+        pass
     os.chdir(home)
 print("ok")

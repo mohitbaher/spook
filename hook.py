@@ -5,7 +5,7 @@ PostToolUse: remember packages/URLs the agent read in untrusted content (provena
 UserPromptSubmit: remember what the user actually asked for.
 Rules decide, Gemma (later) only explains. Fails open when a registry is unreachable.
 """
-import hashlib, io, json, os, re, shlex, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
+import contextlib, hashlib, io, json, os, re, shlex, subprocess, sys, tarfile, time, urllib.error, urllib.request, zipfile
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 
@@ -32,6 +32,58 @@ INJECTION = re.compile(
     r"|\b(note|message|instructions?) (for|to) (ai|llm|coding|automated)\b"
     r"|do not (tell|inform|show|mention)\b[^.\n]{0,30}\bthe user"
     r"|without (asking|telling|informing) the user", re.I)
+
+
+# --- optional Sentry tracing: off unless SPOOK_SENTRY_DSN is set (env or Spook's own .env) and sentry-sdk is installed.
+# Sends item names, scores, reasons, timings and token counts. Never the command, prompts, answers or code.
+SENTRY = None
+
+
+def load_env(path=os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")):
+    """KEY=value lines from Spook's .env into the environment (real environment variables win)."""
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        k, sep, v = line.partition("=")
+        if sep and k.strip() and not k.lstrip().startswith("#"):
+            os.environ.setdefault(k.strip(), v.strip().strip("\"'"))
+
+
+def start_tracing():
+    global SENTRY
+    load_env()
+    if not os.environ.get("SPOOK_SENTRY_DSN"):
+        return
+    try:
+        import sentry_sdk
+    except ImportError:
+        return
+    # auto_enabling_integrations=False: otherwise the SDK imports every AI/web library installed on the
+    # machine (measured: 23 s per hook call with LangChain installed). The stdlib integration stays on,
+    # so registry lookups still show up as http.client spans.
+    sentry_sdk.init(dsn=os.environ["SPOOK_SENTRY_DSN"], traces_sample_rate=1.0, send_default_pii=False,
+                    auto_enabling_integrations=False, shutdown_timeout=2, before_send_transaction=scrub,
+                    environment=os.environ.get("SPOOK_ENV", "local"), release="spook@0.1")
+    SENTRY = sentry_sdk
+
+
+def scrub(event, hint):
+    """The explainer's argv holds the agent's command; the SDK copies it into subprocess spans and extra.sys.argv."""
+    event["spans"] = [s for s in event.get("spans", []) if not s.get("op", "").startswith("subprocess")]
+    event.get("extra", {}).pop("sys.argv", None)
+    return event
+
+
+def span(op, name, **data):
+    """A Sentry span (a transaction when nothing is open yet), or a no-op without tracing."""
+    if not SENTRY:
+        return contextlib.nullcontext()
+    s = SENTRY.start_span(op=op, name=name) if SENTRY.get_current_span() else SENTRY.start_transaction(op=op, name=name)
+    for k, v in data.items():
+        s.set_data(k, v)
+    return s
 
 
 def get(url, accept="application/json"):
@@ -464,8 +516,80 @@ def from_book(item, book):
     if e["verdict"] == "allow":
         return 0, [f"allowed by the user on {e['t'][:10]}"]
     if age_days(e["t"]) < BOOK_DAYS:
-        return 10, [f"in the Book of the Dead since {e['t'][:10]}: {'; '.join(e['reasons'])}"]
+        where = "the shared Book of the Dead" if e.get("by", "").startswith("shared") else "the Book of the Dead"
+        return 10, [f"in {where} since {e['t'][:10]}: {'; '.join(e['reasons'])}"]
     return None
+
+
+# --- optional shared Book of the Dead in MongoDB Atlas: off unless SPOOK_MONGODB_URI is set and pymongo is installed.
+# Shares package verdicts only (name, reasons, time, anonymous reporter ids): never commands, paths, scripts or code.
+def shared_book():
+    """The team's shared collection, or None. Short timeouts: Spook fails open rather than wait on the network."""
+    load_env()
+    if not os.environ.get("SPOOK_MONGODB_URI"):
+        return None
+    try:
+        from pymongo import MongoClient
+    except ImportError:
+        return None
+    client = MongoClient(os.environ["SPOOK_MONGODB_URI"], serverSelectionTimeoutMS=2500, connectTimeoutMS=2500, appname="spook")
+    return client[os.environ.get("SPOOK_MONGODB_DB", "spook")]["book"]
+
+
+def shareable(item):
+    return item.startswith(("npm:", "pip:"))
+
+
+def reporter():
+    """Anonymous, stable id for this machine and user, so one person's repeats count once."""
+    import getpass, platform
+    return hashlib.sha256(f"{platform.node()}/{getpass.getuser()}".encode()).hexdigest()[:12]
+
+
+def pull_shared(items, book, col=None):
+    """Copy shared block verdicts for these package items into `book`. Fails open."""
+    items = [i for i in items if shareable(i) and i not in book]
+    col = col if col is not None else (shared_book() if items else None)
+    if col is None or not items:
+        return
+    with span("db", "mongodb find shared book", **{"db.system": "mongodb", "spook.items": items}):
+        try:
+            for d in col.find({"_id": {"$in": items}, "verdict": "block"}):
+                book[d["_id"]] = {"verdict": "block", "reasons": d["reasons"], "t": d["t"],
+                                  "by": f"shared ({len(d.get('reporters', []))} reporters)"}
+        except Exception:  # offline or slow: the rules check the item normally
+            pass
+
+
+def push_shared(entries, col=None):
+    """Add this machine's package blocks to the shared book (idempotent per reporter)."""
+    entries = {k: e for k, e in entries.items() if shareable(k) and e["verdict"] == "block" and not e.get("by", "").startswith("shared")}
+    col = col if col is not None else (shared_book() if entries else None)
+    if col is None or not entries:
+        return 0
+    from pymongo import UpdateOne
+    me = reporter()
+    with span("db", "mongodb upsert shared book", **{"db.system": "mongodb", "spook.items": list(entries)}):
+        col.bulk_write([UpdateOne({"_id": k}, {"$set": {"verdict": "block", "reasons": e["reasons"], "t": e["t"]},
+                                               "$addToSet": {"reporters": me}, "$setOnInsert": {"first_seen": e["t"]}},
+                                  upsert=True) for k, e in entries.items()])
+    return len(entries)
+
+
+def check_item(item, eco, name, fetch, book):
+    """Rules verdict for one package or local folder; remembers verdicts about the package itself in `book`."""
+    with span("gen_ai.execute_tool", f"execute_tool check_{eco}", **{"gen_ai.operation.name": "execute_tool",
+              "gen_ai.tool.name": f"check_{eco}", "spook.item": item}) as s:
+        try:
+            score, why = check_local(name) if eco == "local" else (check_npm if eco == "npm" else check_pip)(name, fetch)
+        except Exception as e:  # ponytail: fails open when offline; add a strict mode if wanted
+            score, why = 0, [f"unchecked ({type(e).__name__})"]
+        if s:
+            s.set_data("spook.score", score)
+            s.set_data("spook.reasons", why)
+    if score >= DENY_AT and eco != "local":  # remember only verdicts about the package itself, never provenance (that depends on context)
+        book[item] = {"verdict": "block", "reasons": why, "by": "rules", "t": now_iso()}
+    return score, why
 
 
 def check_command(cmd, fetch=get, state=None, book=None, cwd="."):
@@ -483,12 +607,7 @@ def check_command(cmd, fetch=get, state=None, book=None, cwd="."):
         if known := from_book(item, book):  # instant, no network
             results.append((item, *known))
             continue
-        try:
-            score, why = check_local(name) if eco == "local" else (check_npm if eco == "npm" else check_pip)(name, fetch)
-        except Exception as e:  # ponytail: fails open when offline; add a strict mode if wanted
-            score, why = 0, [f"unchecked ({type(e).__name__})"]
-        if score >= DENY_AT and eco != "local":  # remember only verdicts about the package itself, never provenance (that depends on context)
-            book[item] = {"verdict": "block", "reasons": why, "by": "rules", "t": now_iso()}
+        score, why = check_item(item, eco, name, fetch, book)
         extra, pwhy = provenance(item, state)
         results.append((item, score + extra, why + pwhy))
     for u in URL.findall(cmd):
@@ -531,15 +650,33 @@ def describe(bad):
 
 
 def explain(cmd, bad, timeout=150):
-    body = json.dumps({"model": MODEL, "prompt": PROMPT.format(cmd=cmd[:300], items=describe(bad)), "stream": False,
+    text = ollama(PROMPT.format(cmd=cmd[:300], items=describe(bad)), timeout)
+    # the model must not "fix" a squatted name: make sure every blocked package appears verbatim
+    missing = unnamed(bad, text)
+    return text + (f" (Exact blocked package: {', '.join(missing)}.)" if missing else "")
+
+
+def unnamed(bad, text):
+    """Blocked package names the explanation fails to mention verbatim."""
+    names = [i.split(":", 1)[1] for i, _, _ in bad if i.startswith(("npm:", "pip:"))]
+    return [n for n in names if n.lower() not in text.lower()]
+
+
+def ollama(prompt, timeout=150):
+    """Local model answer for a prompt, traced as a gen_ai.chat span when Sentry is on."""
+    body = json.dumps({"model": MODEL, "prompt": prompt, "stream": False,
                        "keep_alive": "15m", "options": {"temperature": 0.2, "num_predict": 120}}).encode()
     req = urllib.request.Request(OLLAMA + "/api/generate", data=body, headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        text = json.load(r)["response"].strip()
-    # the model must not "fix" a squatted name: make sure every blocked package appears verbatim
-    names = [i.split(":", 1)[1] for i, _, _ in bad if i.startswith(("npm:", "pip:"))]
-    missing = [n for n in names if n.lower() not in text.lower()]
-    return text + (f" (Exact blocked package: {', '.join(missing)}.)" if missing else "")
+    with span("gen_ai.chat", f"chat {MODEL}", **{"gen_ai.operation.name": "chat", "gen_ai.system": "ollama",
+              "gen_ai.request.model": MODEL, "gen_ai.request.temperature": 0.2, "gen_ai.request.max_tokens": 120}) as s:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            out = json.load(r)
+        if s:  # Ollama reports its own token counts; the model runs locally, so the cost is zero
+            s.set_data("gen_ai.response.model", out.get("model", MODEL))
+            s.set_data("gen_ai.usage.input_tokens", out.get("prompt_eval_count", 0))
+            s.set_data("gen_ai.usage.output_tokens", out.get("eval_count", 0))
+            s.set_data("gen_ai.usage.total_tokens", out.get("prompt_eval_count", 0) + out.get("eval_count", 0))
+    return out["response"].strip()
 
 
 def notify(text):
@@ -566,12 +703,23 @@ def speak(text):
                    creationflags=0x08000000, timeout=90)
 
 
-def explain_job(cmd, bad):
-    """Background worker: ask local Gemma, log the answer, notify the user. Falls back to the rule reasons."""
-    try:
-        text, by = explain(cmd, bad), MODEL
-    except Exception as e:
-        text, by = f"Spook blocked {describe(bad)}.", f"rules only ({type(e).__name__})"
+def explain_job(cmd, bad, trace=None, share=None):
+    """Background worker: share new package blocks, ask local Gemma, log the answer, notify the user.
+    Falls back to the rule reasons."""
+    start_tracing()
+    tx = SENTRY.continue_trace(trace or {}, op="gen_ai.invoke_agent", name="invoke_agent Spook explainer") if SENTRY else None
+    with SENTRY.start_transaction(tx) if tx else contextlib.nullcontext():
+        if tx:
+            tx.set_data("gen_ai.agent.name", "Spook explainer")
+            tx.set_data("gen_ai.operation.name", "invoke_agent")
+        try:
+            push_shared(share or {})
+        except Exception:  # sharing is best effort; the local book already has the verdict
+            pass
+        try:
+            text, by = explain(cmd, bad), MODEL
+        except Exception as e:
+            text, by = f"Spook blocked {describe(bad)}.", f"rules only ({type(e).__name__})"
     os.makedirs(".spook", exist_ok=True)
     with open(".spook/explanations.jsonl", "a", encoding="utf-8") as f:
         f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": cmd, "explanation": text, "by": by}) + "\n")
@@ -580,8 +728,9 @@ def explain_job(cmd, bad):
         speak(text)
 
 
-def spawn_explainer(cmd, bad):
-    args = [sys.executable, os.path.abspath(__file__), "explain", json.dumps({"cmd": cmd, "bad": bad})]
+def spawn_explainer(cmd, bad, share=None):
+    trace = {"sentry-trace": SENTRY.get_traceparent(), "baggage": SENTRY.get_baggage()} if SENTRY else None  # one trace: block, then explanation
+    args = [sys.executable, os.path.abspath(__file__), "explain", json.dumps({"cmd": cmd, "bad": bad, "trace": trace, "share": share})]
     if os.name != "nt":
         return subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
     flags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
@@ -635,6 +784,46 @@ def book_cli(action, items):
     save_book(book)
 
 
+def sync_cli(col=None):
+    """python hook.py sync: share this project's package blocks and pull the team's into spook-book.json."""
+    col = col if col is not None else shared_book()
+    if col is None:
+        return print("Set SPOOK_MONGODB_URI in Spook's .env (and pip install pymongo) to share the Book of the Dead.")
+    book = load_book()
+    shared = push_shared(book, col)
+    before = len(book)
+    for d in col.find({"verdict": "block"}):
+        if d["_id"] not in book:
+            book[d["_id"]] = {"verdict": "block", "reasons": d["reasons"], "t": d["t"], "by": f"shared ({len(d.get('reporters', []))} reporters)"}
+    save_book(book)
+    print(f"Shared {shared} block(s), pulled {len(book) - before} new; {col.count_documents({})} entries in the shared book.")
+
+
+def ci_cli(paths, fetch=get):
+    """python hook.py ci [manifest ...]: check every dependency in package.json / requirements files, for CI.
+    Prints a Markdown report (also to the GitHub job summary) and returns 1 if anything is blocked."""
+    paths = paths or [p for p in ("package.json", "requirements.txt") if os.path.exists(p)]
+    book, rows = load_book(), []
+    for path in paths:
+        for eco, name in (manifest_deps(path) if path.endswith(".json") else requirement_names(path)):
+            item = f"{eco}:{rel(name) if eco == 'local' else name}"
+            rows.append((path, item, *(from_book(item, book) or check_item(item, eco, name, fetch, book))))
+    bad = [r for r in rows if r[2] >= DENY_AT]
+    lines = ["## Spook dependency check", "",
+             f"Checked {len(rows)} dependencies in {', '.join(f'`{p}`' for p in paths) or 'no manifests'}: "
+             + (f"**{len(bad)} blocked.**" if bad else "nothing blocked.")]
+    if bad:
+        lines += ["", "| Manifest | Item | Score | Why |", "|---|---|---|---|"]
+        lines += [f"| `{p}` | `{i}` | {s} | {'; '.join(w)} |" for p, i, s, w in bad]
+        lines += ["", "Nothing was installed or run; Spook read registry metadata and install scripts as text."]
+    report = "\n".join(lines)
+    print(report)
+    if summary := os.environ.get("GITHUB_STEP_SUMMARY"):
+        with open(summary, "a", encoding="utf-8") as f:
+            f.write(report + "\n")
+    return 1 if bad else 0
+
+
 def install_cli(project):
     """python hook.py install <project-folder>: add Spook's hooks to that project's .claude/settings.json."""
     path = os.path.join(project, ".claude", "settings.json")
@@ -654,9 +843,13 @@ def install_cli(project):
 def main():
     if sys.argv[1:2] == ["explain"]:
         job = json.loads(sys.argv[2])
-        return explain_job(job["cmd"], job["bad"])
+        return explain_job(job["cmd"], job["bad"], job.get("trace"), job.get("share"))
+    if sys.argv[1:2] == ["sync"]:
+        return sync_cli()
     if sys.argv[1:2] == ["install"]:
         return install_cli(sys.argv[2] if len(sys.argv) > 2 else ".")
+    if sys.argv[1:2] == ["ci"]:
+        sys.exit(ci_cli(sys.argv[2:]))
     if sys.argv[1:2] in (["book"], ["allow"], ["forget"]):
         return book_cli(sys.argv[1], sys.argv[2:])
     if sys.argv[1:2] == ["voice"]:  # python hook.py voice on|off, from the project folder
@@ -687,9 +880,20 @@ def main():
     if data.get("tool_name") != "Bash":
         return
     cmd = data.get("tool_input", {}).get("command", "")
+    start_tracing()
+    with span("gen_ai.invoke_agent", "invoke_agent Spook", **{"gen_ai.agent.name": "Spook", "gen_ai.operation.name": "invoke_agent"}) as tx:
+        check_bash(cmd, state, here, tx)
+
+
+def check_bash(cmd, state, here, tx=None):
+    """The PreToolUse decision for one Bash command: check, log, deny the risky part, start the explainer."""
     book = load_book()
     remembered = dict(book)
+    pull_shared([f"{eco}:{name}" for eco, name in installs(cmd, read_files=True, cwd=here)], book)  # a teammate may have met it already
     results = check_command(cmd, state=state, book=book, cwd=here)
+    if tx:
+        tx.set_data("spook.items_checked", len(results))
+        tx.set_data("spook.blocked", [i for i, s, _ in results if s >= DENY_AT])
     if book != remembered:
         save_book(book)
     bad = [r for r in results if r[1] >= DENY_AT]
@@ -702,7 +906,7 @@ def main():
             f.write(json.dumps({"t": time.strftime("%Y-%m-%dT%H:%M:%S"), "cmd": cmd, "blocked": bool(bad),
                                 "items": [{"item": i, "score": s, "why": w} for i, s, w in results]}) + "\n")
     if bad:
-        spawn_explainer(cmd, bad)
+        spawn_explainer(cmd, bad, {k: e for k, e in book.items() if k not in remembered})
         pkgs = " ".join(f'"{i}"' for i, _, _ in bad if i.startswith(("npm:", "pip:", "script:", "local:")))
         override = f' If the user trusts it, they can run this in their own terminal: python "{os.path.abspath(__file__)}" allow {pkgs}' if pkgs else ""
         deny(f"Spook blocked {describe(bad)}. Nothing was run. "
